@@ -70,6 +70,8 @@ class VAE():
 
         ## Prep single cell data for training in VAE -- cell by genes matrix X with gene weight matrix W
         data_list = [torch.from_numpy(np.array(d)).type(torch.float) for d in data_list]
+        self.X_tensor = data_list[0]
+        self.W_tensor = data_list[1]
         dataset = TensorDataset(data_list[0].float(), data_list[1].float())
         kwargs = {'num_workers': num_workers, 'pin_memory':True}
         self.train_loader = DataLoader(dataset, batch_size=batch_size, **kwargs, drop_last=True)

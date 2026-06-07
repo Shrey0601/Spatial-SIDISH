@@ -355,12 +355,20 @@ class SIDISH:
         self.use_spatial_graph = use_spatial_graph
         self.k_neighbors = k_neighbors
         
-        if self.use_spatial_graph and "spatial" in self.adata.obsm:
-            edge_index, edge_weight = get_spatial_graph_from_adata(self.adata, spatial_key="spatial", method="knn", k=self.k_neighbors)
-            self.spatial_graph = (edge_index, edge_weight)
-            print("SIDISH Spatial graph constructed using k-NN with k =", self.k_neighbors)
-            
-        else:
+        self.spatial_graph = None  # always initialised; set below if spatial data is available
+
+        if self.use_spatial_graph:
+            if "spatial" not in self.adata.obsm:
+                print("SIDISH WARNING: use_spatial_graph=True but adata.obsm['spatial'] not found. Falling back to dense VAE.")
+                self.use_spatial_graph = False
+            else:
+                if self.k_neighbors is None:
+                    self.k_neighbors = 5
+                edge_index, edge_weight = get_spatial_graph_from_adata(self.adata, spatial_key="spatial", method="knn", k=self.k_neighbors)
+                self.spatial_graph = (edge_index, edge_weight)
+                print("SIDISH Spatial graph constructed using k-NN with k =", self.k_neighbors)
+
+        if not self.use_spatial_graph:
             print("SIDISH No spatial graph used. Proceeding with dense VAE.")
 
     def init_Phase1(self, epochs: int, i_epochs: int, latent_size: int, layer_dims: list, batch_size: int, optimizer: str, lr: float, lr_3: float, dropout: float, type: str = 'Normal') -> None:
@@ -593,7 +601,12 @@ class SIDISH:
                 # if on GPU put mini-batch into CUDA memory
                 pyro.clear_param_store()
                 x = x.to(self.device, non_blocking=True)
-                z = self.vae.model.get_latent_representation(x)
+                if getattr(self.vae, 'use_spatial', False) and hasattr(self.vae, 'edge_index'):
+                    edge_index = self.vae.edge_index.to(self.device)
+                    edge_weight = self.vae.edge_weight.to(self.device)
+                    z = self.vae.model.get_latent_representation(x, edge_index, edge_weight)
+                else:
+                    z = self.vae.model.get_latent_representation(x)
                 zz = z.cpu().detach().numpy().tolist()
                 self.TZ += zz
 

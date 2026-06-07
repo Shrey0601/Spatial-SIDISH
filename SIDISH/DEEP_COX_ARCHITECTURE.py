@@ -17,8 +17,13 @@ class DEEPCOX_ARCHITECTURE(nn.Module):
         
         super(DEEPCOX_ARCHITECTURE, self).__init__()
 
-        # Extract encoder layers except the final output layer.
-        self.encoder_layer = nn.Sequential(*list(encoder.model.encoder.children())[:-1])
+        enc_module = encoder.model.encoder
+        if getattr(enc_module, 'use_spatial', False):
+            self.encoder_layer = enc_module.before_last_layer
+            last_out = enc_module.fc_mean.in_features
+        else:
+            self.encoder_layer = nn.Sequential(*list(enc_module.children())[:-1])
+            last_out = self.encoder_layer[-1].out_features
         self.af1 = nn.Tanh()
         self.dr1 = nn.Dropout(dropout)
 

@@ -184,7 +184,7 @@ class ARCHITECTURE(nn.Module):
         self.log_theta = torch.nn.Parameter(torch.randn(self.input_dim))
         
         if self.use_spatial:
-            self.encoder = SpatialEncoder(self.input_dim, self.z_dim, self.layer_dims, gcn_dims, dropout)
+            self.encoder = SpatialEncoder(self.input_dim, self.z_dim, self.layer_dims, dropout, gcn_dims)
             self.decoder = Decoder(self.input_dim, self.z_dim, self.layer_dims[::-1], dropout)
             self.before_last_layer = self.encoder.before_last_layer
             
