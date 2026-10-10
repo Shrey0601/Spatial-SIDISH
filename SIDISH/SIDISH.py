@@ -3,6 +3,7 @@ from SIDISH.DEEP_COX import DEEPCOX as DeepCox          # Deep Cox model wrapper
 from SIDISH.VAE import VAE as VAE                        # VAE encoder (Phase 1)
 from SIDISH.Utils import Utils as utils                  # Helper utilities used across phases
 from SIDISH.Utils import get_spatial_graph_from_adata    # Build spatial graph (for spatial-VAE)
+from SIDISH.Utils import compute_covet                   # Pre-compute COVET niche targets
 from SIDISH.in_silico_perturbation import InSilicoPerturbation
 from SIDISH.ppi_network_handler import PPINetworkHandler # Loads/queries PPI network
 from SIDISH.gene_perturbation_utils import GenePerturbationUtils  # Gene KO / network-based adj.
@@ -30,7 +31,7 @@ from scipy.stats import binomtest
 from scipy.stats import wilcoxon
 import pyro
 
-def process_Data(X: np.ndarray, Y: np.ndarray, test_size: float, batch_size: int, seed: int) -> tuple:
+def process_Data(X: np.ndarray, Y: np.ndarray, test_size: float, batch_size: int, seed: int, num_workers: int = 0) -> tuple:
 
     """
     Splits bulk RNA-seq data into training and testing datasets, converts them to tensors, 
@@ -76,8 +77,8 @@ def process_Data(X: np.ndarray, Y: np.ndarray, test_size: float, batch_size: int
     # Test_dataset - X_test, y_test
     test_dataset = TensorDataset(data_list[2].float(), data_list[3].float())
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=X_test.shape[0], shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=X_test.shape[0], shuffle=False, num_workers=num_workers)
 
     return X_train, X_test, y_train, y_test
 
@@ -371,7 +372,9 @@ class SIDISH:
         if not self.use_spatial_graph:
             print("SIDISH No spatial graph used. Proceeding with dense VAE.")
 
-    def init_Phase1(self, epochs: int, i_epochs: int, latent_size: int, layer_dims: list, batch_size: int, optimizer: str, lr: float, lr_3: float, dropout: float, type: str = 'Normal') -> None:
+    def init_Phase1(self, epochs: int, i_epochs: int, latent_size: int, layer_dims: list, batch_size: int, optimizer: str, lr: float, lr_3: float, dropout: float, type: str = 'Normal',
+                    n_covet_genes: int = 50, gat_hidden: int = None, n_heads: int = 4,
+                    lambda_env: float = 1.0, beta_expr: float = 1.0, beta_niche: float = 0.5) -> None:
         """
         Initializes Phase 1: training a Variational Autoencoder (VAE) on single-cell RNA-seq data.
         
@@ -414,13 +417,27 @@ class SIDISH:
         self.batch_size = batch_size
         self.type = type
 
+        # COVET / spatial hyperparameters
+        self.n_covet_genes = n_covet_genes
+        self.gat_hidden = gat_hidden if gat_hidden is not None else layer_dims[-1]
+        self.n_heads = n_heads
+        self.lambda_env = lambda_env
+        self.beta_expr = beta_expr
+        self.beta_niche = beta_niche
+        self.covet_sqrt = None
+        # Set sdh.covet_X_precomputed = <[N, n_covet_genes] array> before train()/reload()
+        # to feed compute_covet() a custom niche-feature matrix (e.g. PCA components
+        # over the full gene panel) instead of the default dispersion-based HVG columns.
+        if not hasattr(self, 'covet_X_precomputed'):
+            self.covet_X_precomputed = None
+
         # Initialise the weight matrix of phase 1
         self.W_matrix = np.ones(self.adata.X.shape)
 
-    def init_Phase2(self, epochs: int, hidden: int, lr: float, dropout: float, test_size: float, batch_size_bulk: int) -> None:
+    def init_Phase2(self, epochs: int, hidden: int, lr: float, dropout: float, test_size: float, batch_size_bulk: int, freeze_trunk: bool = False) -> None:
         """
         Initializes Phase 2: training a Deep Cox model for survival analysis using bulk RNA-seq data.
-        
+
         Parameters
         ----------
         epochs : int
@@ -435,6 +452,11 @@ class SIDISH:
             Proportion of dataset allocated to the test split.
         batch_size_bulk : int
             Number of samples per batch for bulk data.
+        freeze_trunk : bool, optional
+            If False (default), the shared VAE trunk is unfrozen and fine-tuned jointly
+            with the Cox head each iteration (original SIDISH behavior). If True, the
+            trunk is kept frozen and only the small Cox head is trained -- linear-probing
+            transfer learning, useful when the trunk risks overfitting the bulk cohort.
 
         Returns
         -------
@@ -446,6 +468,7 @@ class SIDISH:
         self.lr_2 = lr
         self.dropout_2 = dropout
         self.batch_size_bulk = batch_size_bulk
+        self.freeze_trunk = freeze_trunk
 
         # Initialise the weight  vector of phase 2
         self.W_vector = np.ones(self.bulk.iloc[:,2:].shape[0])
@@ -453,9 +476,9 @@ class SIDISH:
 
         self.X = self.bulk.iloc[:, 2:].values
         self.Y = self.bulk.iloc[:, :2].values
-        self.X_train, self.X_test, self.y_train, self.y_test = process_Data(self.X, self.Y, test_size, batch_size_bulk, self.seed)
+        self.X_train, self.X_test, self.y_train, self.y_test = process_Data(self.X, self.Y, test_size, batch_size_bulk, self.seed, num_workers=0)
 
-    def train(self, iterations: int, percentile: float, steepness: float, path: str, num_workers: int = 0, show: bool = True, distribution_fit:Literal["default", "fitted"] = "default") -> sc.AnnData:
+    def train(self, iterations: int, percentile: float, steepness: float, path: str, num_workers: int = 8, show: bool = True, distribution_fit:Literal["default", "fitted"] = "default") -> sc.AnnData:
         """
         Trains the SIDISH framework iteratively, refining the identification of High-Risk cells.
 
@@ -499,9 +522,17 @@ class SIDISH:
         # Initialise the VAE of phase 1
         if self.use_spatial_graph and self.spatial_graph is not None:
             print("########################################## Using Spatial Graph in VAE ##########################################")
-            self.vae = VAE(epochs=self.epochs_1, adata=self.adata, z_dim=self.latent_size, layer_dims=self.layer_dims, lr=self.lr_1, dropout=self.dropout_1, device=self.device, seed=self.seed, gcn_dims=[32, self.latent_size]) 
-            self.vae.initialize(self.adata, W=self.W_matrix, batch_size=self.batch_size, num_workers=self.num_workers, spatial_graph=self.spatial_graph, num_neighbors=self.k_neighbors)
-        
+            if self.covet_sqrt is None and self.n_covet_genes is not None:
+                print("########################################## Computing COVET targets ##########################################")
+                self.covet_sqrt, self.covet_hvg_idx = compute_covet(
+                    self.adata, n_hvg=self.n_covet_genes, k=self.k_neighbors,
+                    X_precomputed=getattr(self, 'covet_X_precomputed', None),
+                )
+            self.vae = VAE(epochs=self.epochs_1, adata=self.adata, z_dim=self.latent_size, layer_dims=self.layer_dims, lr=self.lr_1, dropout=self.dropout_1, device=self.device, seed=self.seed,
+                           n_covet_genes=self.n_covet_genes, gat_hidden=self.gat_hidden, n_heads=self.n_heads)
+            self.vae.initialize(self.adata, W=self.W_matrix, batch_size=self.batch_size, num_workers=self.num_workers, spatial_graph=self.spatial_graph, num_neighbors=self.k_neighbors,
+                                covet_sqrt=self.covet_sqrt)
+
         else:
             print("########################################## Using Dense VAE ##########################################")
             self.vae = VAE(self.epochs_1,self.adata,self.latent_size, self.layer_dims, self.lr_1, self.dropout_1,self.device, self.seed)
@@ -509,7 +540,10 @@ class SIDISH:
 
         # Initial training of VAE in iteration 1
         print("########################################## ITERATION 1 OUT OF {} ##########################################".format(iterations))
-        self.vae.train()
+        if self.use_spatial_graph and self.spatial_graph is not None:
+            self.vae.train(lambda_env=self.lambda_env, beta_expr=self.beta_expr, beta_niche=self.beta_niche)
+        else:
+            self.vae.train()
 
         # Save VAE for iterative process
         torch.save(self.vae.model.state_dict(), "{}vae_transfer".format(self.path))
@@ -522,13 +556,30 @@ class SIDISH:
         for i in range(iterations):
             self.encoder = self.vae
 
-            self.deepCox_model = DeepCox(self.X_train, self.y_train, self.W_vector, self.hidden, self.encoder, self.device,self.batch_size,self.seed, self.lr_2, self.dropout_2)
+            self.deepCox_model = DeepCox(self.X_train, self.y_train, self.W_vector, self.hidden, self.encoder, self.device,self.batch_size,self.seed, self.lr_2, self.dropout_2, freeze_trunk=self.freeze_trunk)
             self.deepCox_model.train(self.epochs_2)
 
             self.train_loss_Cox.append(self.deepCox_model.get_train_loss())
             self.train_ci_Cox.append(self.deepCox_model.get_train_ci())
             self.test_loss_Cox.append(self.deepCox_model.get_test_loss(self.test_loader))
             self.test_ci_Cox.append(self.deepCox_model.get_test_ci(test_loader=self.test_loader))
+
+            # DIAGNOSTIC: DeepCox train/test C-index per outer iteration. The Cox head's
+            # trunk (encoder_layer) is fully unfrozen and fine-tuned on ~140 bulk patients
+            # with dropout=0 -- a large train/test gap here is the standard overfitting
+            # signature and was never previously surfaced (only test_ci_Cox[-1] was printed).
+            train_ci_i = float(self.train_ci_Cox[-1])
+            test_ci_i = float(self.test_ci_Cox[-1])
+            train_loss_i = float(self.train_loss_Cox[-1])
+            test_loss_i = float(self.test_loss_Cox[-1])
+            gap = train_ci_i - test_ci_i
+            flag = "  <-- large train/test gap, possible overfit" if gap > 0.10 else ""
+            print(f"########################################## DeepCox iter {i}: "
+                  f"train CI={train_ci_i:.4f}  test CI={test_ci_i:.4f}  "
+                  f"gap={gap:+.4f}{flag} ##########################################")
+            print(f"########################################## DeepCox iter {i}: "
+                  f"train loss={train_loss_i:.4f}  test loss={test_loss_i:.4f}"
+                  f" ##########################################")
 
             patients_data = self.X_train[:, :-1].to(self.device)
             
@@ -545,11 +596,27 @@ class SIDISH:
                 
             self.percentile_list.append(self.percentile_cells)
             self.W_vector += self.scores
-            
+
+            # DIAGNOSTIC: high-risk cell count/percentage and patient-weight spread per
+            # iteration -- tracks whether the iterative h/b relabeling is converging or
+            # oscillating, and whether W_vector (per-patient weight) is blowing up.
+            n_h = (self.adata_.obs['SIDISH'] == 'h').sum()
+            print(f"########################################## iter {i}: high-risk cells = {n_h:,} "
+                  f"({100*n_h/self.adata_.n_obs:.1f}%)  percentile_cutoff={self.percentile_cells:.4f}  "
+                  f"W_vector[min/mean/max]=[{float(self.W_vector.min()):.3f}/{float(self.W_vector.mean()):.3f}/{float(self.W_vector.max()):.3f}]"
+                  f" ##########################################")
+
             print("########################################## Calculating Cells Weight Matrix ##########################################")
             self.W_temp = utils.getWeightMatrix(self.adata_, self.seed, self.steepness, self.type)
             self.W_matrix += self.W_temp
             self.W_matrix[self.W_matrix >= 2] = 2
+
+            # DIAGNOSTIC: fraction of the cell-weight matrix already saturated at the clip
+            # ceiling (2.0) -- if this climbs toward 1.0 across iterations, most cells have
+            # stopped getting differentiated feedback and the loop is effectively frozen.
+            saturated_frac = (self.W_matrix >= 2).mean()
+            print(f"########################################## iter {i}: W_matrix mean={self.W_matrix.mean():.4f}  "
+                  f"saturated(>=2) fraction={saturated_frac:.4f} ##########################################")
 
             self.adata = self.adata_.copy()
 
@@ -563,16 +630,18 @@ class SIDISH:
             else:
                 print("########################################## ITERATION {} OUT OF {} ##########################################".format(i+2, iterations))
                 if self.use_spatial_graph and self.spatial_graph is not None:
-                    self.vae = VAE(epochs=self.epochs_3, adata=self.adata, z_dim=self.latent_size, layer_dims=self.layer_dims, lr=self.lr_3, dropout=self.dropout_1, device=self.device, seed=self.seed, gcn_dims=[32, self.latent_size])
-                    self.vae.initialize(self.adata, spatial_graph=self.spatial_graph, W=self.W_matrix, batch_size=self.batch_size, num_neighbors=self.k_neighbors, num_workers=self.num_workers)
+                    self.vae = VAE(epochs=self.epochs_3, adata=self.adata, z_dim=self.latent_size, layer_dims=self.layer_dims, lr=self.lr_3, dropout=self.dropout_1, device=self.device, seed=self.seed,
+                                   n_covet_genes=self.n_covet_genes, gat_hidden=self.gat_hidden, n_heads=self.n_heads)
+                    self.vae.initialize(self.adata, spatial_graph=self.spatial_graph, W=self.W_matrix, batch_size=self.batch_size, num_neighbors=self.k_neighbors, num_workers=self.num_workers,
+                                        covet_sqrt=self.covet_sqrt)
                     self.vae.model.load_state_dict(torch.load("{}vae_transfer".format(self.path)))
-                
+                    self.vae.train(lambda_env=self.lambda_env, beta_expr=self.beta_expr, beta_niche=self.beta_niche)
+
                 else:
                     self.vae = VAE(self.epochs_3,self.adata,self.latent_size, self.layer_dims,self.lr_3, self.dropout_1,self.device, self.seed)
                     self.vae.initialize(self.adata, self.W_matrix, self.batch_size, self.type,self.num_workers)
                     self.vae.model.load_state_dict(torch.load("{}vae_transfer".format(self.path)))
-                
-                self.vae.train()
+                    self.vae.train()
 
                 # Save VAE for iterative process
                 torch.save(self.vae.model.state_dict(), "{}vae_transfer".format(self.path))
@@ -671,14 +740,22 @@ class SIDISH:
 
         return adata_new
 
-    def reload(self, path, num_workers = 0):
+    def reload(self, path, num_workers = 8):
         self.path = path
         self.num_workers = num_workers
         
         if self.use_spatial_graph and self.spatial_graph is not None:
             print("########################################## Using Spatial Graph in VAE ##########################################")
-            self.vae = VAE(epochs=self.epochs_1, adata=self.adata, z_dim=self.latent_size, layer_dims=self.layer_dims, lr=self.lr_1, dropout=self.dropout_1, device=self.device, seed=self.seed, gcn_dims=[32, self.latent_size]) 
-            self.vae.initialize(self.adata, W=self.W_matrix, batch_size=self.batch_size, num_workers=self.num_workers, spatial_graph=self.spatial_graph, num_neighbors=self.k_neighbors)
+            if self.covet_sqrt is None and self.n_covet_genes is not None:
+                print("########################################## Recomputing COVET targets ##########################################")
+                self.covet_sqrt, self.covet_hvg_idx = compute_covet(
+                    self.adata, n_hvg=self.n_covet_genes, k=self.k_neighbors,
+                    X_precomputed=getattr(self, 'covet_X_precomputed', None),
+                )
+            self.vae = VAE(epochs=self.epochs_1, adata=self.adata, z_dim=self.latent_size, layer_dims=self.layer_dims, lr=self.lr_1, dropout=self.dropout_1, device=self.device, seed=self.seed,
+                           n_covet_genes=self.n_covet_genes, gat_hidden=self.gat_hidden, n_heads=self.n_heads)
+            self.vae.initialize(self.adata, W=self.W_matrix, batch_size=self.batch_size, num_workers=self.num_workers, spatial_graph=self.spatial_graph, num_neighbors=self.k_neighbors,
+                                covet_sqrt=self.covet_sqrt)
             self.vae.model.load_state_dict(torch.load("{}vae_transfer".format(self.path)))
         
         else:
@@ -691,7 +768,7 @@ class SIDISH:
         self.encoder = self.vae
         self.W_vector = self.X_train[:, -1]
 
-        self.deepCox_model = DeepCox(self.X_train, self.y_train, self.W_vector, self.hidden, self.encoder, self.device,self.batch_size, self.seed, self.lr_2, self.dropout_2)
+        self.deepCox_model = DeepCox(self.X_train, self.y_train, self.W_vector, self.hidden, self.encoder, self.device,self.batch_size, self.seed, self.lr_2, self.dropout_2, freeze_trunk=getattr(self, 'freeze_trunk', False))
         self.deepCox_model.model.load_state_dict(torch.load("{}deepCox".format(self.path)))
 
         print("✅ Reload complete – VAE and DeepCox restored")
