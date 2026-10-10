@@ -17,18 +17,25 @@ class DEEPCOX_ARCHITECTURE(nn.Module):
         
         super(DEEPCOX_ARCHITECTURE, self).__init__()
 
+        # Cox uses the shared MLP trunk of the VAE encoder. In the dual-encoder
+        # design (post-COVET), `before_last_layer` is the trunk in both spatial
+        # and non-spatial modes; its output feeds either the expression head
+        # (always) or, in spatial mode, the GAT/niche head as well.
         enc_module = encoder.model.encoder
-        if getattr(enc_module, 'use_spatial', False):
-            self.encoder_layer = enc_module.before_last_layer
-            last_out = enc_module.fc_mean.in_features
+        self.encoder_layer = enc_module.before_last_layer
+        if hasattr(self.encoder_layer, 'out_dim'):
+            last_out = self.encoder_layer.out_dim
         else:
-            self.encoder_layer = nn.Sequential(*list(enc_module.children())[:-1])
-            last_out = self.encoder_layer[-1].out_features
+            # Fall back to the expression-mean layer's in_features, which equals
+            # the trunk's output dim.
+            fc_mean = getattr(enc_module, 'fc_expr_mean',
+                              getattr(enc_module, 'fc_mean', None))
+            last_out = fc_mean.in_features
         self.af1 = nn.Tanh()
         self.dr1 = nn.Dropout(dropout)
 
         # Add a new fully connected layer for risk prediction
-        self.new_layer = nn.Linear(self.encoder_layer[-1].out_features, hidden)
+        self.new_layer = nn.Linear(last_out, hidden)
         self.dr2 = nn.Dropout(dropout)
         self.af2 = nn.Tanh()
         self.final_layer = nn.Linear(hidden, 1, bias=False)

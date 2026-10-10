@@ -68,7 +68,16 @@ def loss_DeepCox(pred, events, durations, weight=None, train=True):
 
 class DEEPCOX():
 
-    def __init__(self, X_train, Y_train, weights, hidden, encoder, device, batch_size,seed, lr=0.000001, dropout=0):
+    def __init__(self, X_train, Y_train, weights, hidden, encoder, device, batch_size,seed, lr=0.000001, dropout=0, freeze_trunk=False):
+        """
+        freeze_trunk : bool, optional
+            If False (default, matches original behavior), the VAE trunk (encoder_layer)
+            is unfrozen and fine-tuned jointly with the Cox head on bulk survival data.
+            If True, the trunk is kept frozen (requires_grad=False) and only the small
+            Cox head (new_layer/final_layer) is trained -- a standard linear-probing
+            transfer-learning setup, useful when the trunk (309K params) risks
+            overfitting a small bulk cohort (~140 patients).
+        """
 
         self.device = device
         self.X_train = X_train
@@ -76,10 +85,11 @@ class DEEPCOX():
         self.weights = weights
 
         self.hidden = hidden
-        self.encoder = encoder 
+        self.encoder = encoder
         self.dropout = dropout
         self.lr = lr
         self.seed = seed
+        self.freeze_trunk = freeze_trunk
 
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed(self.seed)
@@ -90,9 +100,11 @@ class DEEPCOX():
         # Initializing the Deep Cox regression model of phase 2 of SIDISH
         self.model = deepCox(hidden=self.hidden, encoder=self.encoder, dropout=self.dropout)
 
-        # Transfer Learning, unfrezzing the weights of the encoder from the VAE from phase 1. Continuing the training from where it left off.
+        # Transfer Learning: by default the encoder trunk from phase 1 is unfrozen and
+        # fine-tuned jointly with the Cox head, continuing training from where it left off.
+        # When freeze_trunk=True, the trunk is kept fixed instead (linear probing).
         for name, para in self.model.encoder_layer.named_parameters():
-            para.requires_grad = True
+            para.requires_grad = not self.freeze_trunk
         self.non_frozen_parameters = [p for p in self.model.parameters() if p.requires_grad]
         self.model = self.model.to(self.device)
         self.opt = optim.Adam(self.non_frozen_parameters, lr=self.lr)

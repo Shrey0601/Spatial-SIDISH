@@ -4,7 +4,7 @@ from scipy.stats import weibull_min
 from imblearn.over_sampling import RandomOverSampler
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from tqdm import tqdm
 from sklearn.metrics import classification_report, roc_auc_score
 from sklearn.utils.class_weight import compute_class_weight
@@ -13,14 +13,18 @@ from sklearn.ensemble import RandomForestClassifier
 from imblearn.under_sampling import RandomUnderSampler
 import copy
 import shap
+import scanpy as sc
 import pandas as pd
 from scipy import stats
+from scipy.linalg import sqrtm
 from typing import Literal
 from scipy.spatial.distance import pdist, squareform
-from sklearn.neighbors import kneighbors_graph
+from sklearn.neighbors import kneighbors_graph, NearestNeighbors
 import torch_geometric.utils as pyg_utils
 from torch_geometric.data import Data
 from scipy.stats import binomtest
+from lifelines import CoxPHFitter
+from lifelines.statistics import logrank_test
 
 def extractFeature(adata,type='Normal'):
     feature_acc = []
@@ -181,6 +185,101 @@ def create_pytorch_geometric_data(adata, spatial_key='spatial', method='knn', k=
     )
     
     return data
+
+
+def compute_covet(adata, n_hvg=50, k=5, spatial_key='spatial', eps=1e-6, X_precomputed=None):
+    """
+    Compute per-cell shifted-covariance niche representation (COVET) and its
+    matrix square root, following Haviv et al. (Nature Biotechnology, 2025).
+
+    For each cell i with k spatial nearest neighbors:
+        COVET_i = (1/k) * (E_i - X_bar)^T (E_i - X_bar)
+    where E_i is the [k, n_hvg] expression of neighbors and X_bar is the
+    GLOBAL mean over all cells (not the local niche mean). The global-mean
+    shift is what makes niches directly comparable across the dataset.
+
+    The matrix square root is returned because AOT distance between niches
+    is L2^2 between their square roots, making it the natural decoder target
+    for an MSE/Frobenius loss.
+
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData with .X (cells x genes) and .obsm[spatial_key] (cells x 2/3).
+    n_hvg : int
+        Number of highly variable genes to use for COVET. Ignored if
+        X_precomputed is given (its column count sets the dimension instead).
+    k : int
+        Number of spatial nearest neighbors per cell (self excluded).
+    spatial_key : str
+        Key in adata.obsm holding spatial coordinates.
+    eps : float
+        Ridge added to the diagonal of COVET before sqrtm for numerical
+        stability when matrices are near-singular.
+    X_precomputed : np.ndarray, optional
+        [N, D] matrix to use directly as the per-cell niche features instead
+        of the internal dispersion-based HVG selection (e.g. PCA components
+        computed over the full gene panel). When given, the internal gene
+        selection is skipped entirely and hvg_idx is returned as None.
+
+    Returns
+    -------
+    covet_sqrt : np.ndarray
+        Array of shape [N, D, D] containing sqrt(COVET_i) for each cell,
+        where D = n_hvg or X_precomputed.shape[1].
+    hvg_idx : np.ndarray or None
+        Indices into adata.var of the selected HVGs (length n_hvg), or None
+        when X_precomputed was used.
+    """
+    if spatial_key not in adata.obsm:
+        raise ValueError(f"Spatial coordinates not found in adata.obsm['{spatial_key}']")
+
+    if X_precomputed is not None:
+        X_hvg = np.asarray(X_precomputed, dtype=np.float32)
+        hvg_idx = None
+    else:
+        X = adata.X
+        if not isinstance(X, np.ndarray):
+            X = X.toarray()
+        X = X.astype(np.float32)
+
+        # Highly variable gene selection by dispersion (Fano factor: var / mean).
+        # Works on raw counts, no extra dependencies. If 'highly_variable' is already
+        # set in adata.var, defer to that selection instead.
+        if 'highly_variable' in adata.var.columns:
+            hvg_idx = np.where(adata.var['highly_variable'].values)[0][:n_hvg]
+            if len(hvg_idx) < n_hvg:
+                mean = X.mean(axis=0)
+                var = X.var(axis=0)
+                dispersion = var / (mean + 1e-8)
+                hvg_idx = np.argsort(-dispersion)[:n_hvg]
+        else:
+            mean = X.mean(axis=0)
+            var = X.var(axis=0)
+            dispersion = var / (mean + 1e-8)
+            hvg_idx = np.argsort(-dispersion)[:n_hvg]
+
+        X_hvg = X[:, hvg_idx]
+
+    n_hvg = X_hvg.shape[1]
+    X_bar = X_hvg.mean(axis=0, keepdims=True)
+
+    coords = adata.obsm[spatial_key]
+    nn = NearestNeighbors(n_neighbors=k + 1).fit(coords)
+    _, knn_idx = nn.kneighbors(coords)
+    knn_idx = knn_idx[:, 1:]
+
+    N = X_hvg.shape[0]
+    covet_sqrt = np.zeros((N, n_hvg, n_hvg), dtype=np.float32)
+    ridge = eps * np.eye(n_hvg, dtype=np.float32)
+    for i in tqdm(range(N), desc='Computing COVET'):
+        E_i = X_hvg[knn_idx[i]]
+        D = E_i - X_bar
+        C = (D.T @ D) / float(k)
+        S = sqrtm(C + ridge)
+        covet_sqrt[i] = np.real(S).astype(np.float32)
+
+    return covet_sqrt, hvg_idx
 
 
 def r_squared(sample, dist, params):
@@ -377,3 +476,172 @@ class Utils():
         print(percentile_cells)
 
         return percentile_cells
+
+
+def cox_weighted_external_validation(bulk_train, gene_list, expr_external, surv_external,
+                                      penalizer_grid=(0.1, 0.5, 1, 2, 5, 10, 20),
+                                      n_folds=5, seed=0):
+    """
+    Score an independent bulk cohort using Cox-weighted marker gene expression,
+    instead of a naive unweighted mean.
+
+    A ridge-penalized CoxPHFitter is fit on `bulk_train` (the SIDISH training
+    cohort) to get signed, per-gene coefficients. The ridge penalizer is chosen
+    by k-fold cross-validation on `bulk_train` ALONE (mean held-out concordance
+    index), never touching `expr_external` — this avoids picking the penalizer
+    against the validation set. The final model (refit on all of bulk_train
+    with the CV-selected penalizer) then scores `expr_external` patients via
+    risk = expression @ coef, splits at the median, and runs a log-rank test
+    against `surv_external`.
+
+    An unweighted mean can null out real signal when marker genes have
+    opposing hazard directions (some raise risk, some lower it) -- averaging
+    them cancels rather than reinforces. Cox weighting fixes this by signing
+    and scaling each gene's contribution before combining.
+
+    Parameters
+    ----------
+    bulk_train : pd.DataFrame
+        Training cohort with 'duration', 'event' columns plus one column per
+        gene in `gene_list`.
+    gene_list : list of str
+        Marker genes to use as Cox covariates. Only genes present in both
+        `bulk_train` and `expr_external` are used.
+    expr_external : pd.DataFrame
+        External cohort expression, patients x genes.
+    surv_external : pd.DataFrame
+        External cohort survival, indexed to match `expr_external`, with
+        'duration' and 'event' columns.
+    penalizer_grid : tuple of float
+        Candidate ridge penalizer strengths to cross-validate over.
+    n_folds : int
+        Number of CV folds for penalizer selection.
+    seed : int
+        Random seed for the fold split.
+
+    Returns
+    -------
+    dict with keys: penalizer, coef (pd.Series), log_rank_p, high_group
+    (pd.Series of bool, indexed like expr_external), risk_scores (np.ndarray)
+    """
+    avail = [g for g in gene_list if g in bulk_train.columns and g in expr_external.columns]
+    if len(avail) < 2:
+        raise ValueError(f"Need >=2 genes present in both cohorts, got {len(avail)}")
+
+    cols = avail + ['duration', 'event']
+    train_df = bulk_train[cols].copy()
+
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    mean_ci = {}
+    for pen in penalizer_grid:
+        fold_cis = []
+        for train_idx, val_idx in skf.split(train_df, train_df['event']):
+            fold_train = train_df.iloc[train_idx]
+            fold_val = train_df.iloc[val_idx]
+            cph = CoxPHFitter(penalizer=pen)
+            cph.fit(fold_train, duration_col='duration', event_col='event')
+            fold_cis.append(cph.score(fold_val, scoring_method='concordance_index'))
+        mean_ci[pen] = np.mean(fold_cis)
+
+    best_penalizer = max(mean_ci, key=mean_ci.get)
+
+    cph_final = CoxPHFitter(penalizer=best_penalizer)
+    cph_final.fit(train_df, duration_col='duration', event_col='event')
+    coef = cph_final.summary['coef'].loc[avail]
+
+    risk_scores = expr_external[avail].values @ coef.values
+    high_group = pd.Series(risk_scores >= np.median(risk_scores), index=expr_external.index)
+
+    lr = logrank_test(
+        surv_external.loc[high_group, 'duration'], surv_external.loc[~high_group, 'duration'],
+        event_observed_A=surv_external.loc[high_group, 'event'],
+        event_observed_B=surv_external.loc[~high_group, 'event'],
+    )
+
+    return dict(
+        penalizer=best_penalizer,
+        cv_concordance=mean_ci,
+        coef=coef,
+        log_rank_p=lr.p_value,
+        high_group=high_group,
+        risk_scores=risk_scores,
+    )
+
+
+def paper_matched_insample_validation(gene_list, expr_external, surv_external, penalizer=0.0):
+    """
+    DIAGNOSTIC ONLY -- NOT a test of generalization. Do not report this as external
+    validation on its own; always pair it with cox_weighted_external_validation()'s
+    blind (TCGA-fit) result and label both clearly.
+
+    Matches the SIDISH paper's own described Kaplan-Meier methodology (Methods,
+    "Kaplan-Meier survival analysis"): a Cox model is fit DIRECTLY on the same
+    cohort it is then tested on -- i.e. `expr_external`/`surv_external` supplies
+    both the coefficients AND the test set. This lets the model see the external
+    cohort's own survival outcomes before scoring it, so a small p-value here
+    only shows the gene list CAN be tuned to fit this cohort's own outcomes, not
+    that it generalizes to unseen patients. Use it to check whether a poor blind
+    result is due to weak marker genes (this would also look poor) or genuinely
+    just to test-strictness (this would look strong even when the blind result
+    doesn't).
+
+    Parameters
+    ----------
+    gene_list : list of str
+        Marker genes to use as Cox covariates. Only genes present in
+        `expr_external` are used.
+    expr_external : pd.DataFrame
+        External cohort expression, patients x genes -- supplies BOTH the
+        Cox-fitting data and the test set (paper's described approach).
+    surv_external : pd.DataFrame
+        External cohort survival, indexed to match `expr_external`, with
+        'duration' and 'event' columns.
+    penalizer : float
+        Ridge penalizer for numerical stability only (the paper describes a
+        "simple Cox regression model" with no mention of regularization;
+        0.0 is lifelines' own default and matches that description literally
+        -- raised only if the fit fails to converge).
+
+    Returns
+    -------
+    dict with keys: penalizer, coef (pd.Series), log_rank_p, high_group,
+    risk_scores (np.ndarray), converged (bool), note (str)
+    """
+    avail = [g for g in gene_list if g in expr_external.columns]
+    if len(avail) < 2:
+        raise ValueError(f"Need >=2 genes present in expr_external, got {len(avail)}")
+
+    cols = avail + ['duration', 'event']
+    df = expr_external.join(surv_external[['duration', 'event']])[cols].dropna()
+
+    converged = True
+    pen = penalizer
+    cph = CoxPHFitter(penalizer=pen)
+    try:
+        cph.fit(df, duration_col='duration', event_col='event')
+    except Exception:
+        converged = False
+        pen = max(penalizer, 0.1)
+        cph = CoxPHFitter(penalizer=pen)
+        cph.fit(df, duration_col='duration', event_col='event')
+
+    coef = cph.summary['coef'].loc[avail]
+    risk_scores = df[avail].values @ coef.values
+    high_group = pd.Series(risk_scores >= np.median(risk_scores), index=df.index)
+
+    lr = logrank_test(
+        df.loc[high_group, 'duration'], df.loc[~high_group, 'duration'],
+        event_observed_A=df.loc[high_group, 'event'],
+        event_observed_B=df.loc[~high_group, 'event'],
+    )
+
+    return dict(
+        penalizer=pen,
+        coef=coef,
+        log_rank_p=lr.p_value,
+        high_group=high_group,
+        risk_scores=risk_scores,
+        converged=converged,
+        note="DIAGNOSTIC ONLY -- Cox fit directly on the same cohort tested (paper-matched "
+             "methodology). Not a generalization test; pair with the blind TCGA-fit result.",
+    )
