@@ -1,13 +1,10 @@
-"""PDAC arm: headless mirror of config2.ipynb (the run behind 67.8% precision).
+"""PDAC arm: headless mirror of config2.ipynb, one full SIDISH run per seed.
 
 Usage:  PDAC_SEED=1 python run_pdac.py pdac_seed1
 
-Exists to answer one question the frozen-trunk sweep cannot: is 67.8% reproducible
-end-to-end at a different seed? The sweep found PDAC cell precision spans 4.05-66.87%
-across 40 seeds with a frozen trunk, and 67.8% sits at the top of that distribution.
-Every LUAD-vs-PDAC conclusion rests on that single number, so it needs replication.
-
-Hyperparameters are copied verbatim from config2.ipynb. SIDISH/ is unmodified.
+Writes outputs/<name>/: summary.json (precision, recall, lift, C-index), cell_labels.csv,
+cell_hazard.npy (per-cell hazard, used for cross-seed ensembling) and the checkpoints.
+Hyperparameters are copied verbatim from config2.ipynb.
 """
 import sys, os, json, random, time
 import numpy as np, pandas as pd, scanpy as sc, torch

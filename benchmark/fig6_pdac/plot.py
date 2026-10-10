@@ -1,5 +1,5 @@
-"""Fig-6-style figure for PDAC Xenium. Row 1 = paper's metrics (in-sample TCGA); row 2 = added
-honest metrics (out-of-fold TCGA, external GSE224564, cell-level ground truth)."""
+"""Fig-6-style figure for PDAC Xenium. Row 1 = paper's metrics (in-sample TCGA); row 2 = additional
+metrics (out-of-fold TCGA, external GSE224564, cell-level ground truth)."""
 import numpy as np, pandas as pd
 from scipy.stats import mannwhitneyu
 import matplotlib; matplotlib.use('Agg')

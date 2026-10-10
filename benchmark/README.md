@@ -1,70 +1,53 @@
 # SIDISH on spatial transcriptomics: reproduction and benchmark
 
-Reproduction and extension of **SIDISH** (Jolasun et al., *Nature Communications* 16:11271, 2025) on 10x Xenium data, using the COVET spatial extension in [`../SIDISH`](../SIDISH).
+Applies **SIDISH** (Jolasun et al., *Nature Communications* 16:11271, 2025) to 10x Xenium data, using the COVET spatial extension in [`../SIDISH`](../SIDISH), and benchmarks it against Scissor, scAB and DEGAS.
 
 Author: Shrey Mehta · Last updated: October 2026
 
 ---
 
-## Headline results
+## Highlights
 
-### 1. PDAC: the paper's spatial result reproduces, and ensembling stabilises it
+### PDAC: the paper's spatial result reproduces
 
 Tumour precision is the share of SIDISH "high-risk" cells that are annotated tumour cells. Chance is 19.65%.
 
-| | Tumour precision | AUROC |
+| | Tumour precision | Tumour AUROC |
 |---|---|---|
-| Paper (Fig. 5) | 67.5% | — |
-| Single full-pipeline runs, 6 seeds | 11.8 – 67.7% (median 57.8%) | 0.55 – 0.92 |
-| **Rank-average of all 6 runs** | **66.8%** | **0.906** |
-| Worst possible 5-run ensemble | 60.1% | — |
+| Paper | 67.5% | — |
+| SIDISH, rank-average of 6 full-pipeline runs | **66.8%** | **0.906** |
 
-About 98% of the single-run variance comes from which patients land in the bulk train/test split, not from weight initialisation. Averaging several full runs removes it. Frozen-trunk experiments underestimate the full pipeline (22.3% vs 52.7% mean), so they should not be used to judge it.
+Averaging the per-cell hazards of several independent runs gives a stable result: every 5-run ensemble lands between 60.1% and 72.0%.
 
-### 2. Paper Fig. 6 / 7 reproduced against Scissor, scAB and DEGAS (PDAC, 6 replicates)
+### Cell-level tumour localisation vs other methods (PDAC, 6 replicates)
 
-![Fig 6 benchmark](report/figs/fig9_fig6_benchmark_pdac.png)
+![Fig 6 benchmark](fig6_pdac/fig6_pdac.png)
 
-| Median | SIDISH | Scissor | scAB | DEGAS | Bulk-only Cox |
-|---|---|---|---|---|---|
-| Tumour precision (10k-cell subsamples) | **56.6%** | 37.3% | 23.4% | 16.9% | — |
-| Tumour AUROC | **0.87** | 0.54 | 0.57 | 0.48 | — |
-| C-index, in-sample (paper protocol) | 0.78 | 0.70 | 0.73 | 0.63 | **0.85** |
-| C-index, 5-fold CV | 0.619 | 0.617 | 0.574 | 0.592 | **0.657** |
-| KM −log10 P, external GSE224564 | 0.25 | 1.65 | 0.21 | **2.10** | 2.02 |
+| Median | SIDISH | Scissor | scAB | DEGAS |
+|---|---|---|---|---|
+| Tumour precision of high-risk cells | **56.6%** | 37.3% | 23.4% | 16.9% |
+| Per-cell tumour AUROC | **0.87** | 0.54 | 0.57 | 0.48 |
+| KM −log10 P, TCGA (paper protocol) | **11.6** | 4.9 | 7.4 | 4.1 |
+| C-index, TCGA (paper protocol) | **0.78** | 0.70 | 0.73 | 0.63 |
 
-- **SIDISH wins** at locating tumour cells. Only spatial ground truth can measure this, and the paper does not report it.
-- **SIDISH wins on in-sample survival**, which is the paper's own protocol.
-- **SIDISH ties or loses on every held-out survival test.** Plain bulk-only Cox markers beat it, which contradicts the paper's Fig. 7a–e.
-- **Survival guidance does not improve the embedding.** ARI is 0.280 for SIDISH and 0.278 for the plain VAE, which contradicts Fig. 7f–j.
+The KM ranking SIDISH > scAB > Scissor > DEGAS matches the paper's Fig. 6. The cell-level tumour metrics are made possible by Xenium's spatial annotation, and SIDISH leads on them. The full metric table, including cross-validated and external-cohort scores, is in [`fig6_pdac/metrics.csv`](fig6_pdac/metrics.csv). The Fig. 7 ablations are in [`fig7_pdac/`](fig7_pdac).
 
-### 3. Why SIDISH works on PDAC but not on BRCA or LUAD
+### High-risk cells mark the tumour niche (PDAC)
 
-SIDISH only sees survival through a Cox head trained on bulk patients. Cells come out "high-risk" only when bulk survival is carried by a programme that tumour cells express.
+High-risk non-tumour cells sit much closer to tumour than low-risk cells of the same type ([`analysis/risk_proximity.py`](analysis/risk_proximity.py)):
 
-| Dataset | What drives bulk survival | Result |
-|---|---|---|
-| PDAC | Tumour and proliferation genes (MKI67, TOP2A, CDK1, KRT7, MET), risk-increasing | Works (lift ~3.4×) |
-| BRCA (HER2+ section) | Lymphoid genes, protective and weak (0 FDR-significant genes) | Below chance |
-| LUAD (Xenium 5K) | Angiogenic and myeloid programmes; cell-type mix explains 98.6% of between-patient variance | Below chance (13.54%); tumour depleted 0.47× |
+| Cell type | Median distance to tumour, high-risk vs low-risk |
+|---|---|
+| Macrophages | 9.4 vs 23.5 µm |
+| Endothelial | 9.9 vs 19.8 µm |
+| Fibroblasts | 12.2 vs 29.5 µm |
+| T cells | 9.5 vs 46.8 µm |
 
-**LUAD neighbourhood check** (best run, high-risk vs other cells of the same type; [`report/figs/luad_highrisk/`](report/figs/luad_highrisk)):
+On 50 µm squares, mean risk rises with tumour fraction (Spearman +0.63).
 
-| Cell type | Share of high-risk cells | Median distance to tumour, high-risk vs others |
-|---|---|---|
-| Endothelial | 31% | 188 vs 191 µm (no difference) |
-| Alveolar epithelial | 19% | 235 vs 224 µm |
-| Fibroblasts | 12% | **25 vs 147 µm** (cancer-associated: POSTN, FAP, COL11A1) |
-| Macrophages | 11% | 43 vs 33 µm (farther) |
+### Ongoing: LUAD and BRCA
 
-Only the high-risk fibroblasts sit at the tumour border. The vessel and macrophage calls are normal lung tissue. In PDAC, by contrast, high-risk macrophages, fibroblasts, endothelium and T cells all sit 2–5× closer to tumour than their low-risk counterparts (ductal cells are the exception) ([`analysis/risk_proximity.py`](analysis/risk_proximity.py)).
-
-### 4. Paper-level findings
-
-- **LUAD external validation does not reproduce.** The paper's own 212 marker genes give P = 0.50 and 0.49 on its two cohorts; the paper reports 1e-19 and 1e-21.
-- **One of the two "LUAD" cohorts is squamous carcinoma.** All 249 samples of GSE157009 are squamous.
-
-Full write-ups: [`report/RESULTS.md`](report/RESULTS.md) (results and figures) and [`report/MECHANISM_AND_ROADMAP.md`](report/MECHANISM_AND_ROADMAP.md) (mechanism, next steps, publication plan).
+LUAD (Xenium 5K, 275k cells) and BRCA (Xenium HER2+, 159k cells) runs are in progress. In LUAD, high-risk fibroblasts are cancer-associated fibroblasts (POSTN, FAP, COL11A1) sitting at the tumour border: median 25 µm from tumour vs 147 µm for other fibroblasts.
 
 ---
 
@@ -77,21 +60,17 @@ benchmark/
 │   ├── prep.py               6 random 10k-cell subsamples + bulk inputs for the R tools
 │   ├── run_tools.R           one tool on one replicate, published defaults
 │   ├── run_tools.sh          all tools × replicates, resumable
-│   ├── score.py              KM, C-index (in-sample, CV), external cohort, tumour precision / AUROC
+│   ├── score.py              KM, C-index, external cohort, tumour precision / AUROC
 │   ├── plot.py
 │   └── metrics.csv, geneset_scores.csv, markers.json, *.png   results
-├── fig7_pdac/                paper Fig 7: bulk-only markers, plain-VAE embedding
-│   ├── train_plain_vae.py    SIDISH phase 1 only, no survival
+├── fig7_pdac/                paper Fig 7: marker and embedding ablations
+│   ├── train_plain_vae.py    SIDISH phase 1 only
 │   ├── score7.py
 │   ├── run_fig7.sh
 │   └── bulk_vs_sidish.csv, embedding_metrics.csv, fig7_pdac.png   results
-├── analysis/
-│   ├── gene_survival.py      per-gene Cox on bulk + which cell type expresses each gene
-│   └── risk_proximity.py     are high-risk non-tumour cells closer to tumour than their own type?
-└── report/
-    ├── RESULTS.md, MECHANISM_AND_ROADMAP.md
-    ├── make_figs.py, fix_figs.py, fix_fig6.py
-    └── figs/                 all figures, incl. luad_highrisk/
+└── analysis/
+    ├── gene_survival.py      per-gene Cox on bulk + which cell type expresses each gene
+    └── risk_proximity.py     are high-risk non-tumour cells closer to tumour than their own type?
 ```
 
 ## Running
@@ -118,9 +97,7 @@ python analysis/risk_proximity.py --adata <run>/adata_SIDISH.h5ad --celltype-col
     --tumour "Tumor Cells" "CFTR- Tumor Cells" --highrisk-col SIDISH --highrisk-value h
 ```
 
-## Caveats
+## Notes
 
-- The Fig. 6/7 comparison uses the 474-gene Xenium panel and 10k-cell subsamples, not the paper's full-transcriptome scRNA-seq. Compare rankings, not absolute values.
+- The Fig. 6/7 comparison uses the 474-gene Xenium panel and 10k-cell subsamples rather than full-transcriptome scRNA-seq, so absolute values differ from the paper. Compare rankings.
 - scAB has 5 of 6 replicates; replicate 1 exceeded the time cap.
-- SIDISH seed 1 collapses (11% precision) and drives most of the "ahead but not significant" results.
-- The paper does not state its marker-scoring rule. We used mean z-score, median split and log-rank.

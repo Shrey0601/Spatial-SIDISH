@@ -3,7 +3,7 @@
       bootstrap seed r gives 6 replicates). SIDISH rows are read from fig6_pdac/metrics.csv.
  f-j  SIDISH latent (6 seeds) vs simple VAE latent (phase-1 only, no survival): k-means with
       k = #cell types, 20 inits each, on a fixed 20k-cell subsample, scored vs celltype_major.
- k-m  not reproducible: SIDISH does not save per-iteration labels/latents.
+ k-m  not computed here (needs per-iteration labels/latents).
 """
 import os, sys, glob, numpy as np, pandas as pd, scanpy as sc, scipy.sparse as sp, torch, gzip, warnings
 from lifelines import CoxPHFitter
