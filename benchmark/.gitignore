@@ -1,0 +1,15 @@
+# data and run outputs (see DATA_SETUP.md)
+outputs/
+PAAD/
+LUAD_validation/
+fig6_pdac/inputs/
+fig6_pdac/results/
+fig7_pdac/plain_vae_seed*
+*.h5ad
+*.npy
+*.log
+*.done
+.venv*/
+__pycache__/
+*.pyc
+.Rhistory

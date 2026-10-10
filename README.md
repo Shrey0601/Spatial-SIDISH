@@ -1,6 +1,8 @@
 # **SIDISH**  
 **SIDISH Identifies High-Risk Disease-Associated Cells and Biomarkers by Integrating Single-Cell Depth and Bulk Breadth**
 
+> **Spatial benchmark:** reproduction of the paper on 10x Xenium data (PDAC, LUAD, BRCA) and a head-to-head benchmark against Scissor, scAB and DEGAS are in [`benchmark/`](benchmark/README.md).
+
 ## Table of Contents
 - [Key Capabilities](#key-capabilities)
 - [Methods Overview](#methods-overview)
